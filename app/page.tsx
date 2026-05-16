@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 const MLB_API = "https://statsapi.mlb.com/api/v1";
+const SEASON = "2026";
 
 interface Game {
   gamePk: number;
@@ -17,8 +18,15 @@ interface Game {
 }
 
 interface PitcherStats {
-  era: string; whip: string; strikeOuts: string;
-  baseOnBalls: string; inningsPitched: string; wins: string; losses: string;
+  era: string;
+  whip: string;
+  strikeOuts: string;
+  baseOnBalls: string;
+  inningsPitched: string;
+  wins: string;
+  losses: string;
+  strikeoutsPer9: string;
+  walksPer9: string;
 }
 
 interface RecentForm {
@@ -27,14 +35,31 @@ interface RecentForm {
   lastStarts: number;
 }
 
-interface TeamStats { avg: string; ops: string; runs: string; homeRuns: string; }
+interface TeamBatting {
+  avg: string;
+  ops: string;
+  obp: string;
+  slg: string;
+  runs: string;
+  homeRuns: string;
+  runsPerGame: string;
+}
+
+interface PoissonResult {
+  homeExpected: number;
+  awayExpected: number;
+  homeWinProb: number;
+  awayWinProb: number;
+  drawProb: number;
+}
 
 interface GameAnalysis {
   game: Game;
   homePitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
   awayPitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
-  homeTeamStats: TeamStats | null;
-  awayTeamStats: TeamStats | null;
+  homeBatting: TeamBatting | null;
+  awayBatting: TeamBatting | null;
+  poisson: PoissonResult | null;
   score: number;
   recommendation: string;
   confidence: number;
@@ -57,28 +82,36 @@ interface Pick {
 
 async function fetchPitcherStats(pitcherId: number): Promise<PitcherStats | null> {
   try {
-    const res = await fetch(`${MLB_API}/people/${pitcherId}/stats?stats=season&season=2025&group=pitching`);
+    const res = await fetch(`${MLB_API}/people/${pitcherId}/stats?stats=season&season=${SEASON}&group=pitching`);
     const data = await res.json();
     const splits = data.stats?.[0]?.splits;
     if (!splits?.length) return null;
     const s = splits[0].stat;
-    return { era: s.era ?? "N/A", whip: s.whip ?? "N/A", strikeOuts: s.strikeOuts ?? "0", baseOnBalls: s.baseOnBalls ?? "0", inningsPitched: s.inningsPitched ?? "0", wins: s.wins ?? "0", losses: s.losses ?? "0" };
+    return {
+      era: s.era ?? "N/A",
+      whip: s.whip ?? "N/A",
+      strikeOuts: s.strikeOuts ?? "0",
+      baseOnBalls: s.baseOnBalls ?? "0",
+      inningsPitched: s.inningsPitched ?? "0",
+      wins: s.wins ?? "0",
+      losses: s.losses ?? "0",
+      strikeoutsPer9: s.strikeoutsPer9Inn ?? "0",
+      walksPer9: s.walksPer9Inn ?? "0",
+    };
   } catch { return null; }
 }
 
 async function fetchRecentForm(pitcherId: number): Promise<RecentForm | null> {
   try {
-    const res = await fetch(`${MLB_API}/people/${pitcherId}/stats?stats=gameLog&season=2025&group=pitching`);
+    const res = await fetch(`${MLB_API}/people/${pitcherId}/stats?stats=gameLog&season=${SEASON}&group=pitching`);
     const data = await res.json();
     const splits = data.stats?.[0]?.splits ?? [];
     const last5 = splits.slice(-5);
     if (!last5.length) return null;
     let totalER = 0, totalIP = 0;
     for (const g of last5) {
-      const ip = parseFloat(g.stat.inningsPitched ?? "0");
-      const er = parseFloat(g.stat.earnedRuns ?? "0");
-      totalER += er;
-      totalIP += ip;
+      totalIP += parseFloat(g.stat.inningsPitched ?? "0");
+      totalER += parseFloat(g.stat.earnedRuns ?? "0");
     }
     const recentEra = totalIP > 0 ? ((totalER * 9) / totalIP).toFixed(2) : "N/A";
     const recentEraNum = parseFloat(recentEra);
@@ -87,44 +120,113 @@ async function fetchRecentForm(pitcherId: number): Promise<RecentForm | null> {
   } catch { return null; }
 }
 
-async function fetchTeamStats(teamId: number): Promise<TeamStats | null> {
+async function fetchTeamBatting(teamId: number): Promise<TeamBatting | null> {
   try {
-    const res = await fetch(`${MLB_API}/teams/${teamId}/stats?stats=season&season=2025&group=hitting`);
+    const res = await fetch(`${MLB_API}/teams/${teamId}/stats?stats=season&season=${SEASON}&group=hitting`);
     const data = await res.json();
     const splits = data.stats?.[0]?.splits;
     if (!splits?.length) return null;
     const s = splits[0].stat;
-    return { avg: s.avg ?? ".000", ops: s.ops ?? ".000", runs: s.runs ?? "0", homeRuns: s.homeRuns ?? "0" };
+    const games = parseFloat(s.gamesPlayed ?? "1");
+    const runs = parseFloat(s.runs ?? "0");
+    return {
+      avg: s.avg ?? ".000",
+      ops: s.ops ?? ".000",
+      obp: s.obp ?? ".000",
+      slg: s.slg ?? ".000",
+      runs: s.runs ?? "0",
+      homeRuns: s.homeRuns ?? "0",
+      runsPerGame: games > 0 ? (runs / games).toFixed(2) : "0.00",
+    };
   } catch { return null; }
 }
 
-function calcScore(hp: PitcherStats | null, ap: PitcherStats | null, ht: TeamStats | null, at: TeamStats | null, hf: RecentForm | null, af: RecentForm | null) {
+function calcPoisson(homeBatting: TeamBatting | null, awayBatting: TeamBatting | null, homePitcher: PitcherStats | null, awayPitcher: PitcherStats | null): PoissonResult | null {
+  if (!homeBatting || !awayBatting) return null;
+  const leagueAvgRuns = 4.5;
+  let homeExpected = parseFloat(homeBatting.runsPerGame) || leagueAvgRuns;
+  let awayExpected = parseFloat(awayBatting.runsPerGame) || leagueAvgRuns;
+
+  if (awayPitcher) {
+    const era = parseFloat(awayPitcher.era);
+    if (!isNaN(era)) {
+      const pitcherFactor = era / leagueAvgRuns;
+      homeExpected = homeExpected * pitcherFactor * 0.9;
+    }
+  }
+  if (homePitcher) {
+    const era = parseFloat(homePitcher.era);
+    if (!isNaN(era)) {
+      const pitcherFactor = era / leagueAvgRuns;
+      awayExpected = awayExpected * pitcherFactor * 0.9;
+    }
+  }
+
+  homeExpected = Math.max(1.5, Math.min(8, homeExpected));
+  awayExpected = Math.max(1.5, Math.min(8, awayExpected));
+
+  function poissonProb(lambda: number, k: number): number {
+    let result = Math.exp(-lambda);
+    for (let i = 1; i <= k; i++) result *= lambda / i;
+    return result;
+  }
+
+  let homeWin = 0, awayWin = 0, draw = 0;
+  const maxRuns = 15;
+  for (let h = 0; h <= maxRuns; h++) {
+    for (let a = 0; a <= maxRuns; a++) {
+      const p = poissonProb(homeExpected, h) * poissonProb(awayExpected, a);
+      if (h > a) homeWin += p;
+      else if (a > h) awayWin += p;
+      else draw += p;
+    }
+  }
+
+  const total = homeWin + awayWin + draw;
+  return {
+    homeExpected: Math.round(homeExpected * 10) / 10,
+    awayExpected: Math.round(awayExpected * 10) / 10,
+    homeWinProb: Math.round((homeWin / total) * 100),
+    awayWinProb: Math.round((awayWin / total) * 100),
+    drawProb: Math.round((draw / total) * 100),
+  };
+}
+
+function calcScore(
+  hp: PitcherStats | null, ap: PitcherStats | null,
+  hb: TeamBatting | null, ab: TeamBatting | null,
+  hf: RecentForm | null, af: RecentForm | null,
+  poisson: PoissonResult | null
+) {
   let score = 50;
+
   if (hp) {
     const era = parseFloat(hp.era);
-    if (!isNaN(era)) score += era < 3.0 ? 12 : era < 4.0 ? 6 : era < 5.0 ? 0 : -6;
+    if (!isNaN(era)) score += era < 3.0 ? 10 : era < 4.0 ? 5 : era < 5.0 ? 0 : -5;
     const whip = parseFloat(hp.whip);
-    if (!isNaN(whip)) score += whip < 1.1 ? 8 : whip < 1.3 ? 3 : -4;
+    if (!isNaN(whip)) score += whip < 1.1 ? 6 : whip < 1.3 ? 2 : -3;
   }
-  if (hf) {
-    if (hf.trend === "hot") score += 10;
-    else if (hf.trend === "cold") score -= 10;
-  }
+  if (hf) score += hf.trend === "hot" ? 8 : hf.trend === "cold" ? -8 : 0;
+
   if (ap) {
     const era = parseFloat(ap.era);
-    if (!isNaN(era)) score -= era < 3.0 ? 12 : era < 4.0 ? 6 : era < 5.0 ? 0 : -6;
+    if (!isNaN(era)) score -= era < 3.0 ? 10 : era < 4.0 ? 5 : era < 5.0 ? 0 : -5;
   }
-  if (af) {
-    if (af.trend === "hot") score -= 10;
-    else if (af.trend === "cold") score += 10;
+  if (af) score -= af.trend === "hot" ? 8 : af.trend === "cold" ? -8 : 0;
+
+  if (hb) {
+    const ops = parseFloat(hb.ops);
+    if (!isNaN(ops)) score += ops > 0.800 ? 5 : ops > 0.720 ? 2 : -2;
   }
-  if (ht) {
-    const ops = parseFloat(ht.ops);
-    if (!isNaN(ops)) score += ops > 0.800 ? 6 : ops > 0.720 ? 2 : -2;
+
+  if (poisson) {
+    const poissonBias = poisson.homeWinProb - 50;
+    score += poissonBias * 0.3;
   }
+
   score = Math.max(15, Math.min(85, score));
   const rec = score >= 62 ? "✅ Local favorito" : score <= 38 ? "⚠️ Visitante ventaja" : "➡️ Partido parejo";
-  return { score, rec, conf: Math.round(Math.abs(score - 50) * 2) };
+  return { score: Math.round(score), rec, conf: Math.round(Math.abs(score - 50) * 2) };
 }
 
 function getRating(score: number) {
@@ -137,9 +239,7 @@ function getRating(score: number) {
 
 function getTrendEmoji(form: RecentForm | null) {
   if (!form) return "";
-  if (form.trend === "hot") return "🔥";
-  if (form.trend === "cold") return "📉";
-  return "➡️";
+  return form.trend === "hot" ? "🔥" : form.trend === "cold" ? "📉" : "➡️";
 }
 
 async function dbGet(): Promise<Pick[]> {
@@ -186,20 +286,24 @@ export default function MLBApp() {
       const analyses: GameAnalysis[] = await Promise.all(gameList.map(async (game) => {
         const hpId = game.teams.home.probablePitcher?.id;
         const apId = game.teams.away.probablePitcher?.id;
-        const [hp, ap, ht, at, hf, af] = await Promise.all([
+        const [hp, ap, hb, ab, hf, af] = await Promise.all([
           hpId ? fetchPitcherStats(hpId) : null,
           apId ? fetchPitcherStats(apId) : null,
-          fetchTeamStats(game.teams.home.team.id),
-          fetchTeamStats(game.teams.away.team.id),
+          fetchTeamBatting(game.teams.home.team.id),
+          fetchTeamBatting(game.teams.away.team.id),
           hpId ? fetchRecentForm(hpId) : null,
           apId ? fetchRecentForm(apId) : null,
         ]);
-        const { score, rec, conf } = calcScore(hp, ap, ht, at, hf, af);
+        const poisson = calcPoisson(hb, ab, hp, ap);
+        const { score, rec, conf } = calcScore(hp, ap, hb, ab, hf, af, poisson);
         return {
           game,
           homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp, form: hf },
           awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap, form: af },
-          homeTeamStats: ht, awayTeamStats: at, score, recommendation: rec, confidence: conf
+          homeBatting: hb,
+          awayBatting: ab,
+          poisson,
+          score, recommendation: rec, confidence: conf
         };
       }));
       setGames(analyses.sort((a, b) => b.score - a.score));
@@ -248,7 +352,7 @@ export default function MLBApp() {
             <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg, #C8102E, #002D72)", display: "flex", alignItems: "center", justifyContent: "center" }}>⚾</div>
             <div>
               <div style={{ fontSize: 15, fontWeight: 700, letterSpacing: "0.08em" }}>MLB STATS</div>
-              <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em" }}>ANÁLISIS DE APUESTAS</div>
+              <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em" }}>ANÁLISIS DE APUESTAS • {SEASON}</div>
             </div>
           </div>
           <div style={{ fontSize: 11, color: "#4A6080", textAlign: "right" }}>
@@ -259,7 +363,7 @@ export default function MLBApp() {
         <div style={{ display: "flex", gap: 8 }}>
           {["games", "picks"].map(t => (
             <button key={t} onClick={() => { setView(t as "games" | "picks"); setSelected(null); }}
-              style={{ flex: 1, padding: "8px", borderRadius: 8, border: "1px solid", fontSize: 12, fontWeight: 600, cursor: "pointer", letterSpacing: "0.05em", borderColor: view === t ? "#00E096" : "#1A2535", background: view === t ? "#00E09615" : "transparent", color: view === t ? "#00E096" : "#4A6080" }}>
+              style={{ flex: 1, padding: "8px", borderRadius: 8, border: "1px solid", fontSize: 12, fontWeight: 600, cursor: "pointer", borderColor: view === t ? "#00E096" : "#1A2535", background: view === t ? "#00E09615" : "transparent", color: view === t ? "#00E096" : "#4A6080" }}>
               {t === "games" ? `🎮 JUEGOS (${games.length})` : `📊 MIS PICKS (${picks.length})`}
             </button>
           ))}
@@ -269,7 +373,7 @@ export default function MLBApp() {
       {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "50vh", gap: 16 }}>
           <div style={{ width: 40, height: 40, border: "3px solid #1A2535", borderTopColor: "#00E096", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-          <div style={{ color: "#4A6080", fontSize: 12 }}>Analizando juegos y forma reciente...</div>
+          <div style={{ color: "#4A6080", fontSize: 12 }}>Analizando juegos 2026...</div>
           <style>{`@keyframes spin { to { transform: rotate(360deg); }}`}</style>
         </div>
       ) : view === "picks" ? (
@@ -289,12 +393,10 @@ export default function MLBApp() {
 }
 
 function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; rank: number; onClick: () => void; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, score, recommendation, confidence } = analysis;
+  const { game, homePitcher, awayPitcher, score, recommendation, confidence, poisson } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.some(p => p.game_pk === game.gamePk);
-  const homeTrend = getTrendEmoji(homePitcher.form);
-  const awayTrend = getTrendEmoji(awayPitcher.form);
 
   return (
     <div onClick={onClick} style={{ background: "#0D1520", border: `1px solid ${rank <= 3 ? rating.color + "40" : "#1A2535"}`, borderRadius: 10, padding: "12px 14px", cursor: "pointer", position: "relative", overflow: "hidden" }}>
@@ -313,24 +415,28 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{game.teams.away.team.name}</div>
-          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>🔴 {awayPitcher.name} {awayTrend}</div>
+          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>🔴 {awayPitcher.name} {getTrendEmoji(awayPitcher.form)}</div>
         </div>
         <div style={{ padding: "0 8px", color: "#4A6080", fontSize: 10, flexShrink: 0 }}>VS</div>
         <div style={{ flex: 1, minWidth: 0, textAlign: "right" }}>
           <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{game.teams.home.team.name}</div>
-          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{homeTrend} {homePitcher.name} 🏠</div>
+          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{getTrendEmoji(homePitcher.form)} {homePitcher.name} 🏠</div>
         </div>
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid #1A2535" }}>
         <div style={{ fontSize: 11, color: rating.color }}>{recommendation}</div>
-        <div style={{ fontSize: 11, color: "#4A6080" }}>Conf: <span style={{ color: "#7A9CC0" }}>{confidence}%</span></div>
+        {poisson && (
+          <div style={{ fontSize: 11, color: "#4A6080" }}>
+            Poisson: <span style={{ color: "#7A9CC0" }}>{poisson.homeWinProb}%</span> local
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks }: { analysis: GameAnalysis; onBack: () => void; onSavePick: (a: GameAnalysis, pick: string) => void; savingPick: boolean; pickSaved: boolean; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, homeTeamStats, awayTeamStats, score, recommendation, confidence } = analysis;
+  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, poisson, score, recommendation, confidence } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.find(p => p.game_pk === game.gamePk);
@@ -338,12 +444,35 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
   return (
     <div style={{ padding: "16px 20px" }}>
       <button onClick={onBack} style={{ background: "none", border: "1px solid #1A2535", borderRadius: 8, color: "#7A9CC0", padding: "6px 12px", cursor: "pointer", fontSize: 12, marginBottom: 16 }}>← Volver</button>
+
       <div style={{ background: `linear-gradient(135deg, ${rating.color}15, #0D1520)`, border: `1px solid ${rating.color}40`, borderRadius: 12, padding: "16px", marginBottom: 14, textAlign: "center" }}>
         <div style={{ fontSize: 44, fontWeight: 700, color: rating.color, lineHeight: 1 }}>{score}</div>
         <div style={{ fontSize: 12, color: "#7A9CC0", marginTop: 4 }}>Score de análisis</div>
         <div style={{ fontSize: 15, color: rating.color, fontWeight: 600, marginTop: 6 }}>{recommendation}</div>
         <div style={{ fontSize: 11, color: "#4A6080", marginTop: 4 }}>{time} CT • {game.venue?.name}</div>
       </div>
+
+      {poisson && (
+        <div style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "12px 14px", marginBottom: 14 }}>
+          <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 10 }}>MODELO POISSON</div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
+            {[
+              ["LOCAL GANA", `${poisson.homeWinProb}%`, "#00E096"],
+              ["EMPATE", `${poisson.drawProb}%`, "#FFD84D"],
+              ["VISITANTE", `${poisson.awayWinProb}%`, "#FF9F43"]
+            ].map(([l, v, c]) => (
+              <div key={l} style={{ background: "#080C14", borderRadius: 8, padding: "8px", textAlign: "center" }}>
+                <div style={{ fontSize: 9, color: "#4A6080" }}>{l}</div>
+                <div style={{ fontSize: 18, fontWeight: 700, color: c, marginTop: 2 }}>{v}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", justifyContent: "space-around", fontSize: 11, color: "#4A6080" }}>
+            <span>Carreras esperadas local: <strong style={{ color: "#E8EDF5" }}>{poisson.homeExpected}</strong></span>
+            <span>Visitante: <strong style={{ color: "#E8EDF5" }}>{poisson.awayExpected}</strong></span>
+          </div>
+        </div>
+      )}
 
       {alreadyPicked ? (
         <div style={{ background: "#00E09615", border: "1px solid #00E09640", borderRadius: 10, padding: "12px", marginBottom: 14, textAlign: "center" }}>
@@ -368,13 +497,14 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
         {[
-          { label: "VISITANTE", pitcher: awayPitcher, team: awayTeamStats, emoji: "🔴", teamName: game.teams.away.team.name },
-          { label: "LOCAL", pitcher: homePitcher, team: homeTeamStats, emoji: "🏠", teamName: game.teams.home.team.name }
-        ].map(({ label, pitcher, team, emoji, teamName }) => (
+          { label: "VISITANTE", pitcher: awayPitcher, batting: awayBatting, emoji: "🔴", teamName: game.teams.away.team.name },
+          { label: "LOCAL", pitcher: homePitcher, batting: homeBatting, emoji: "🏠", teamName: game.teams.home.team.name }
+        ].map(({ label, pitcher, batting, emoji, teamName }) => (
           <div key={label} style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: 12 }}>
             <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 4 }}>{label}</div>
             <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{teamName}</div>
             <div style={{ fontSize: 11, color: "#7A9CC0", marginBottom: 8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{emoji} {pitcher.name}</div>
+
             {pitcher.form && (
               <div style={{ marginBottom: 8, padding: "6px 8px", borderRadius: 6, background: pitcher.form.trend === "hot" ? "#00E09615" : pitcher.form.trend === "cold" ? "#FF6B6B15" : "#1A2535", border: `1px solid ${pitcher.form.trend === "hot" ? "#00E09640" : pitcher.form.trend === "cold" ? "#FF6B6B40" : "#1A2535"}` }}>
                 <div style={{ fontSize: 9, color: "#4A6080" }}>ÚLTIMAS {pitcher.form.lastStarts} SALIDAS</div>
@@ -383,23 +513,26 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
                 </div>
               </div>
             )}
+
             {pitcher.stats ? (
-              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
-                {[["ERA", pitcher.stats.era], ["WHIP", pitcher.stats.whip], ["K", pitcher.stats.strikeOuts], ["BB", pitcher.stats.baseOnBalls]].map(([l, v]) => (
-                  <div key={l} style={{ background: "#080C14", borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
-                    <div style={{ fontSize: 9, color: "#4A6080" }}>{l} temp.</div>
-                    <div style={{ fontSize: 14, fontWeight: 700 }}>{v}</div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 8 }}>
+                {[["ERA", pitcher.stats.era], ["WHIP", pitcher.stats.whip], ["K/9", pitcher.stats.strikeoutsPer9], ["BB/9", pitcher.stats.walksPer9]].map(([l, v]) => (
+                  <div key={l} style={{ background: "#080C14", borderRadius: 6, padding: "5px 6px", textAlign: "center" }}>
+                    <div style={{ fontSize: 9, color: "#4A6080" }}>{l}</div>
+                    <div style={{ fontSize: 13, fontWeight: 700 }}>{v}</div>
                   </div>
                 ))}
               </div>
-            ) : <div style={{ fontSize: 11, color: "#4A6080" }}>Sin datos</div>}
-            {team && (
-              <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px solid #1A2535" }}>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
-                  {[["AVG", team.avg], ["OPS", team.ops]].map(([l, v]) => (
-                    <div key={l} style={{ background: "#080C14", borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
+            ) : <div style={{ fontSize: 11, color: "#4A6080", marginBottom: 8 }}>Sin datos pitcher</div>}
+
+            {batting && (
+              <div style={{ paddingTop: 8, borderTop: "1px solid #1A2535" }}>
+                <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 6 }}>OFENSIVA DEL EQUIPO</div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4 }}>
+                  {[["AVG", batting.avg], ["OBP", batting.obp], ["SLG", batting.slg], ["OPS", batting.ops], ["R/G", batting.runsPerGame], ["HR", batting.homeRuns]].map(([l, v]) => (
+                    <div key={l} style={{ background: "#080C14", borderRadius: 6, padding: "5px 6px", textAlign: "center" }}>
                       <div style={{ fontSize: 9, color: "#4A6080" }}>{l}</div>
-                      <div style={{ fontSize: 14, fontWeight: 700 }}>{v}</div>
+                      <div style={{ fontSize: 13, fontWeight: 700 }}>{v}</div>
                     </div>
                   ))}
                 </div>

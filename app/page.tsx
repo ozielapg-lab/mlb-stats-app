@@ -67,7 +67,6 @@ interface GameAnalysis {
 }
 
 interface Pick {
-  id: number;
   game_pk: number;
   created_at: string;
   game_date: string;
@@ -81,87 +80,52 @@ interface Pick {
   units: number;
 }
 
-// Poisson random number generator
 function poissonRandom(lambda: number): number {
   const L = Math.exp(-lambda);
   let k = 0;
   let p = 1;
-  do {
-    k++;
-    p *= Math.random();
-  } while (p > L);
+  do { k++; p *= Math.random(); } while (p > L);
   return k - 1;
 }
 
-// Monte Carlo simulation
 function runMonteCarlo(
-  homeBatting: TeamBatting | null,
-  awayBatting: TeamBatting | null,
-  homePitcher: PitcherStats | null,
-  awayPitcher: PitcherStats | null,
-  homeForm: RecentForm | null,
-  awayForm: RecentForm | null
+  homeBatting: TeamBatting | null, awayBatting: TeamBatting | null,
+  homePitcher: PitcherStats | null, awayPitcher: PitcherStats | null,
+  homeForm: RecentForm | null, awayForm: RecentForm | null
 ): SimulationResult | null {
   if (!homeBatting || !awayBatting) return null;
-
   const leagueAvg = 4.5;
-
-  // Base expected runs per game
   let homeLambda = parseFloat(homeBatting.runsPerGame) || leagueAvg;
   let awayLambda = parseFloat(awayBatting.runsPerGame) || leagueAvg;
 
-  // Adjust by opposing pitcher ERA
   if (awayPitcher) {
     const era = parseFloat(awayPitcher.era);
-    if (!isNaN(era) && era > 0) {
-      homeLambda = homeLambda * (era / leagueAvg) * 0.85;
-    }
+    if (!isNaN(era) && era > 0) homeLambda = homeLambda * (era / leagueAvg) * 0.85;
   }
   if (homePitcher) {
     const era = parseFloat(homePitcher.era);
-    if (!isNaN(era) && era > 0) {
-      awayLambda = awayLambda * (era / leagueAvg) * 0.85;
-    }
+    if (!isNaN(era) && era > 0) awayLambda = awayLambda * (era / leagueAvg) * 0.85;
   }
-
-  // Adjust by recent form
   if (homeForm) {
-    const recentEra = parseFloat(homeForm.recentEra);
-    if (!isNaN(recentEra) && recentEra > 0) {
-      const formFactor = recentEra / leagueAvg;
-      awayLambda = awayLambda * formFactor * 0.15 + awayLambda * 0.85;
-    }
+    const re = parseFloat(homeForm.recentEra);
+    if (!isNaN(re) && re > 0) awayLambda = awayLambda * (re / leagueAvg) * 0.15 + awayLambda * 0.85;
   }
   if (awayForm) {
-    const recentEra = parseFloat(awayForm.recentEra);
-    if (!isNaN(recentEra) && recentEra > 0) {
-      const formFactor = recentEra / leagueAvg;
-      homeLambda = homeLambda * formFactor * 0.15 + homeLambda * 0.85;
-    }
+    const re = parseFloat(awayForm.recentEra);
+    if (!isNaN(re) && re > 0) homeLambda = homeLambda * (re / leagueAvg) * 0.15 + homeLambda * 0.85;
   }
-
-  // Home field advantage
-  homeLambda *= 1.05;
-
-  homeLambda = Math.max(1.5, Math.min(9, homeLambda));
+  homeLambda = Math.max(1.5, Math.min(9, homeLambda * 1.05));
   awayLambda = Math.max(1.5, Math.min(9, awayLambda));
 
-  let homeWins = 0;
-  let awayWins = 0;
-  let totalHomeRuns = 0;
-  let totalAwayRuns = 0;
-
+  let homeWins = 0, awayWins = 0, totalHomeRuns = 0, totalAwayRuns = 0;
   for (let i = 0; i < MONTE_CARLO_RUNS; i++) {
-    const homeRuns = poissonRandom(homeLambda);
-    const awayRuns = poissonRandom(awayLambda);
-    totalHomeRuns += homeRuns;
-    totalAwayRuns += awayRuns;
-    if (homeRuns > awayRuns) homeWins++;
-    else if (awayRuns > homeRuns) awayWins++;
-    // ties go to extra innings — slight home advantage
+    const h = poissonRandom(homeLambda);
+    const a = poissonRandom(awayLambda);
+    totalHomeRuns += h; totalAwayRuns += a;
+    if (h > a) homeWins++;
+    else if (a > h) awayWins++;
     else homeWins += 0.5;
   }
-
   return {
     homeWinPct: Math.round((homeWins / MONTE_CARLO_RUNS) * 100),
     awayWinPct: Math.round((awayWins / MONTE_CARLO_RUNS) * 100),
@@ -178,17 +142,7 @@ async function fetchPitcherStats(pitcherId: number): Promise<PitcherStats | null
     const splits = data.stats?.[0]?.splits;
     if (!splits?.length) return null;
     const s = splits[0].stat;
-    return {
-      era: s.era ?? "N/A",
-      whip: s.whip ?? "N/A",
-      strikeOuts: s.strikeOuts ?? "0",
-      baseOnBalls: s.baseOnBalls ?? "0",
-      inningsPitched: s.inningsPitched ?? "0",
-      wins: s.wins ?? "0",
-      losses: s.losses ?? "0",
-      strikeoutsPer9: s.strikeoutsPer9Inn ?? "0",
-      walksPer9: s.walksPer9Inn ?? "0",
-    };
+    return { era: s.era ?? "N/A", whip: s.whip ?? "N/A", strikeOuts: s.strikeOuts ?? "0", baseOnBalls: s.baseOnBalls ?? "0", inningsPitched: s.inningsPitched ?? "0", wins: s.wins ?? "0", losses: s.losses ?? "0", strikeoutsPer9: s.strikeoutsPer9Inn ?? "0", walksPer9: s.walksPer9Inn ?? "0" };
   } catch { return null; }
 }
 
@@ -200,14 +154,10 @@ async function fetchRecentForm(pitcherId: number): Promise<RecentForm | null> {
     const last5 = splits.slice(-5);
     if (!last5.length) return null;
     let totalER = 0, totalIP = 0;
-    for (const g of last5) {
-      totalIP += parseFloat(g.stat.inningsPitched ?? "0");
-      totalER += parseFloat(g.stat.earnedRuns ?? "0");
-    }
+    for (const g of last5) { totalIP += parseFloat(g.stat.inningsPitched ?? "0"); totalER += parseFloat(g.stat.earnedRuns ?? "0"); }
     const recentEra = totalIP > 0 ? ((totalER * 9) / totalIP).toFixed(2) : "N/A";
-    const recentEraNum = parseFloat(recentEra);
-    const trend = recentEraNum < 3.0 ? "hot" : recentEraNum > 5.0 ? "cold" : "neutral";
-    return { recentEra, trend, lastStarts: last5.length };
+    const n = parseFloat(recentEra);
+    return { recentEra, trend: n < 3.0 ? "hot" : n > 5.0 ? "cold" : "neutral", lastStarts: last5.length };
   } catch { return null; }
 }
 
@@ -220,49 +170,18 @@ async function fetchTeamBatting(teamId: number): Promise<TeamBatting | null> {
     const s = splits[0].stat;
     const games = parseFloat(s.gamesPlayed ?? "1");
     const runs = parseFloat(s.runs ?? "0");
-    return {
-      avg: s.avg ?? ".000",
-      ops: s.ops ?? ".000",
-      obp: s.obp ?? ".000",
-      slg: s.slg ?? ".000",
-      runs: s.runs ?? "0",
-      homeRuns: s.homeRuns ?? "0",
-      runsPerGame: games > 0 ? (runs / games).toFixed(2) : "0.00",
-    };
+    return { avg: s.avg ?? ".000", ops: s.ops ?? ".000", obp: s.obp ?? ".000", slg: s.slg ?? ".000", runs: s.runs ?? "0", homeRuns: s.homeRuns ?? "0", runsPerGame: games > 0 ? (runs / games).toFixed(2) : "0.00" };
   } catch { return null; }
 }
 
-function calcScore(
-  hp: PitcherStats | null, ap: PitcherStats | null,
-  hb: TeamBatting | null, ab: TeamBatting | null,
-  hf: RecentForm | null, af: RecentForm | null,
-  sim: SimulationResult | null
-) {
+function calcScore(hp: PitcherStats | null, ap: PitcherStats | null, hb: TeamBatting | null, ab: TeamBatting | null, hf: RecentForm | null, af: RecentForm | null, sim: SimulationResult | null) {
   let score = 50;
-
-  if (hp) {
-    const era = parseFloat(hp.era);
-    if (!isNaN(era)) score += era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4;
-    const whip = parseFloat(hp.whip);
-    if (!isNaN(whip)) score += whip < 1.1 ? 5 : whip < 1.3 ? 2 : -3;
-  }
+  if (hp) { const era = parseFloat(hp.era); if (!isNaN(era)) score += era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4; const whip = parseFloat(hp.whip); if (!isNaN(whip)) score += whip < 1.1 ? 5 : whip < 1.3 ? 2 : -3; }
   if (hf) score += hf.trend === "hot" ? 6 : hf.trend === "cold" ? -6 : 0;
-  if (ap) {
-    const era = parseFloat(ap.era);
-    if (!isNaN(era)) score -= era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4;
-  }
+  if (ap) { const era = parseFloat(ap.era); if (!isNaN(era)) score -= era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4; }
   if (af) score -= af.trend === "hot" ? 6 : af.trend === "cold" ? -6 : 0;
-  if (hb) {
-    const ops = parseFloat(hb.ops);
-    if (!isNaN(ops)) score += ops > 0.800 ? 4 : ops > 0.720 ? 1 : -2;
-  }
-
-  // Monte Carlo carries the most weight
-  if (sim) {
-    const mcBias = (sim.homeWinPct - 50) * 0.5;
-    score += mcBias;
-  }
-
+  if (hb) { const ops = parseFloat(hb.ops); if (!isNaN(ops)) score += ops > 0.800 ? 4 : ops > 0.720 ? 1 : -2; }
+  if (sim) score += (sim.homeWinPct - 50) * 0.5;
   score = Math.max(15, Math.min(85, score));
   const rec = score >= 62 ? "✅ Local favorito" : score <= 38 ? "⚠️ Visitante ventaja" : "➡️ Partido parejo";
   return { score: Math.round(score), rec, conf: Math.round(Math.abs(score - 50) * 2) };
@@ -299,8 +218,8 @@ async function dbInsert(row: object) {
   });
 }
 
-async function dbUpdate(id: number, row: object) {
-  await fetch(`${SUPABASE_URL}/rest/v1/picks?id=eq.${id}`, {
+async function dbUpdate(gamePk: number, row: object) {
+  await fetch(`${SUPABASE_URL}/rest/v1/picks?game_pk=eq.${gamePk}`, {
     method: "PATCH",
     headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, "Content-Type": "application/json" },
     body: JSON.stringify(row)
@@ -339,9 +258,7 @@ export default function MLBApp() {
           game,
           homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp, form: hf },
           awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap, form: af },
-          homeBatting: hb,
-          awayBatting: ab,
-          simulation: sim,
+          homeBatting: hb, awayBatting: ab, simulation: sim,
           score, recommendation: rec, confidence: conf
         };
       }));
@@ -373,8 +290,8 @@ export default function MLBApp() {
     setTimeout(() => setPickSaved(false), 2000);
   }
 
-  async function markResult(pickId: number, result: "W" | "L") {
-    await dbUpdate(pickId, { result });
+  async function markResult(gamePk: number, result: "W" | "L") {
+    await dbUpdate(gamePk, { result });
     dbGet().then(setPicks);
   }
 
@@ -464,18 +381,14 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid #1A2535" }}>
         <div style={{ fontSize: 11, color: rating.color }}>{recommendation}</div>
-        {simulation && (
-          <div style={{ fontSize: 11, color: "#4A6080" }}>
-            MC: <span style={{ color: "#7A9CC0", fontWeight: 700 }}>{simulation.homeWinPct}%</span> local
-          </div>
-        )}
+        {simulation && <div style={{ fontSize: 11, color: "#4A6080" }}>MC: <span style={{ color: "#7A9CC0", fontWeight: 700 }}>{simulation.homeWinPct}%</span> local</div>}
       </div>
     </div>
   );
 }
 
 function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks }: { analysis: GameAnalysis; onBack: () => void; onSavePick: (a: GameAnalysis, pick: string) => void; savingPick: boolean; pickSaved: boolean; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, simulation, score, recommendation, confidence } = analysis;
+  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, simulation, score, recommendation } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.find(p => p.game_pk === game.gamePk);
@@ -483,7 +396,6 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
   return (
     <div style={{ padding: "16px 20px" }}>
       <button onClick={onBack} style={{ background: "none", border: "1px solid #1A2535", borderRadius: 8, color: "#7A9CC0", padding: "6px 12px", cursor: "pointer", fontSize: 12, marginBottom: 16 }}>← Volver</button>
-
       <div style={{ background: `linear-gradient(135deg, ${rating.color}15, #0D1520)`, border: `1px solid ${rating.color}40`, borderRadius: 12, padding: "16px", marginBottom: 14, textAlign: "center" }}>
         <div style={{ fontSize: 44, fontWeight: 700, color: rating.color, lineHeight: 1 }}>{score}</div>
         <div style={{ fontSize: 12, color: "#7A9CC0", marginTop: 4 }}>Score de análisis</div>
@@ -493,9 +405,7 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
 
       {simulation && (
         <div style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "14px", marginBottom: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em" }}>MONTE CARLO — {simulation.simulations.toLocaleString()} SIMULACIONES</div>
-          </div>
+          <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 10 }}>MONTE CARLO — {simulation.simulations.toLocaleString()} SIMULACIONES</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
             <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.homeWinPct > simulation.awayWinPct ? "#00E09640" : "#1A2535"}` }}>
               <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 4 }}>LOCAL GANA</div>
@@ -546,16 +456,12 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
             <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 4 }}>{label}</div>
             <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{teamName}</div>
             <div style={{ fontSize: 11, color: "#7A9CC0", marginBottom: 8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{emoji} {pitcher.name}</div>
-
             {pitcher.form && (
               <div style={{ marginBottom: 8, padding: "6px 8px", borderRadius: 6, background: pitcher.form.trend === "hot" ? "#00E09615" : pitcher.form.trend === "cold" ? "#FF6B6B15" : "#1A2535", border: `1px solid ${pitcher.form.trend === "hot" ? "#00E09640" : pitcher.form.trend === "cold" ? "#FF6B6B40" : "#1A2535"}` }}>
                 <div style={{ fontSize: 9, color: "#4A6080" }}>ÚLTIMAS {pitcher.form.lastStarts} SALIDAS</div>
-                <div style={{ fontSize: 14, fontWeight: 700, color: pitcher.form.trend === "hot" ? "#00E096" : pitcher.form.trend === "cold" ? "#FF6B6B" : "#FFD84D" }}>
-                  ERA {pitcher.form.recentEra} {getTrendEmoji(pitcher.form)}
-                </div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: pitcher.form.trend === "hot" ? "#00E096" : pitcher.form.trend === "cold" ? "#FF6B6B" : "#FFD84D" }}>ERA {pitcher.form.recentEra} {getTrendEmoji(pitcher.form)}</div>
               </div>
             )}
-
             {pitcher.stats ? (
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 4, marginBottom: 8 }}>
                 {[["ERA", pitcher.stats.era], ["WHIP", pitcher.stats.whip], ["K/9", pitcher.stats.strikeoutsPer9], ["BB/9", pitcher.stats.walksPer9]].map(([l, v]) => (
@@ -566,7 +472,6 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
                 ))}
               </div>
             ) : <div style={{ fontSize: 11, color: "#4A6080", marginBottom: 8 }}>Sin datos pitcher</div>}
-
             {batting && (
               <div style={{ paddingTop: 8, borderTop: "1px solid #1A2535" }}>
                 <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 6 }}>OFENSIVA DEL EQUIPO</div>
@@ -587,7 +492,7 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
   );
 }
 
-function PicksView({ picks, onMarkResult, wins, losses, winRate }: { picks: Pick[]; onMarkResult: (id: number, r: "W" | "L") => void; wins: number; losses: number; winRate: number }) {
+function PicksView({ picks, onMarkResult, wins, losses, winRate }: { picks: Pick[]; onMarkResult: (gamePk: number, r: "W" | "L") => void; wins: number; losses: number; winRate: number }) {
   return (
     <div style={{ padding: "16px 20px" }}>
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 16 }}>
@@ -609,7 +514,7 @@ function PicksView({ picks, onMarkResult, wins, losses, winRate }: { picks: Pick
           {picks.map(pick => {
             const rating = getRating(pick.score);
             return (
-              <div key={pick.id} style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "12px 14px" }}>
+              <div key={pick.game_pk} style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "12px 14px" }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
                   <div style={{ fontSize: 11, color: "#4A6080" }}>{pick.game_date}</div>
                   <div style={{ fontSize: 12, fontWeight: 700, color: rating.color, background: rating.color + "20", borderRadius: 4, padding: "1px 6px" }}>{pick.score}</div>
@@ -622,8 +527,8 @@ function PicksView({ picks, onMarkResult, wins, losses, winRate }: { picks: Pick
                   </div>
                 ) : (
                   <div style={{ display: "flex", gap: 6 }}>
-                    <button onClick={() => onMarkResult(pick.id, "W")} style={{ flex: 1, padding: "6px", borderRadius: 6, border: "1px solid #00E09640", background: "#00E09615", color: "#00E096", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>✓ GANADO</button>
-                    <button onClick={() => onMarkResult(pick.id, "L")} style={{ flex: 1, padding: "6px", borderRadius: 6, border: "1px solid #FF6B6B40", background: "#FF6B6B15", color: "#FF6B6B", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>✗ PERDIDO</button>
+                    <button onClick={() => onMarkResult(pick.game_pk, "W")} style={{ flex: 1, padding: "6px", borderRadius: 6, border: "1px solid #00E09640", background: "#00E09615", color: "#00E096", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>✓ GANADO</button>
+                    <button onClick={() => onMarkResult(pick.game_pk, "L")} style={{ flex: 1, padding: "6px", borderRadius: 6, border: "1px solid #FF6B6B40", background: "#FF6B6B15", color: "#FF6B6B", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>✗ PERDIDO</button>
                   </div>
                 )}
               </div>

@@ -5,6 +5,7 @@ const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
 const MLB_API = "https://statsapi.mlb.com/api/v1";
 const SEASON = "2026";
+const MONTE_CARLO_RUNS = 10000;
 
 interface Game {
   gamePk: number;
@@ -45,12 +46,12 @@ interface TeamBatting {
   runsPerGame: string;
 }
 
-interface PoissonResult {
-  homeExpected: number;
-  awayExpected: number;
-  homeWinProb: number;
-  awayWinProb: number;
-  drawProb: number;
+interface SimulationResult {
+  homeWinPct: number;
+  awayWinPct: number;
+  avgHomeRuns: number;
+  avgAwayRuns: number;
+  simulations: number;
 }
 
 interface GameAnalysis {
@@ -59,7 +60,7 @@ interface GameAnalysis {
   awayPitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
   homeBatting: TeamBatting | null;
   awayBatting: TeamBatting | null;
-  poisson: PoissonResult | null;
+  simulation: SimulationResult | null;
   score: number;
   recommendation: string;
   confidence: number;
@@ -78,6 +79,96 @@ interface Pick {
   my_pick: string;
   result: string | null;
   units: number;
+}
+
+// Poisson random number generator
+function poissonRandom(lambda: number): number {
+  const L = Math.exp(-lambda);
+  let k = 0;
+  let p = 1;
+  do {
+    k++;
+    p *= Math.random();
+  } while (p > L);
+  return k - 1;
+}
+
+// Monte Carlo simulation
+function runMonteCarlo(
+  homeBatting: TeamBatting | null,
+  awayBatting: TeamBatting | null,
+  homePitcher: PitcherStats | null,
+  awayPitcher: PitcherStats | null,
+  homeForm: RecentForm | null,
+  awayForm: RecentForm | null
+): SimulationResult | null {
+  if (!homeBatting || !awayBatting) return null;
+
+  const leagueAvg = 4.5;
+
+  // Base expected runs per game
+  let homeLambda = parseFloat(homeBatting.runsPerGame) || leagueAvg;
+  let awayLambda = parseFloat(awayBatting.runsPerGame) || leagueAvg;
+
+  // Adjust by opposing pitcher ERA
+  if (awayPitcher) {
+    const era = parseFloat(awayPitcher.era);
+    if (!isNaN(era) && era > 0) {
+      homeLambda = homeLambda * (era / leagueAvg) * 0.85;
+    }
+  }
+  if (homePitcher) {
+    const era = parseFloat(homePitcher.era);
+    if (!isNaN(era) && era > 0) {
+      awayLambda = awayLambda * (era / leagueAvg) * 0.85;
+    }
+  }
+
+  // Adjust by recent form
+  if (homeForm) {
+    const recentEra = parseFloat(homeForm.recentEra);
+    if (!isNaN(recentEra) && recentEra > 0) {
+      const formFactor = recentEra / leagueAvg;
+      awayLambda = awayLambda * formFactor * 0.15 + awayLambda * 0.85;
+    }
+  }
+  if (awayForm) {
+    const recentEra = parseFloat(awayForm.recentEra);
+    if (!isNaN(recentEra) && recentEra > 0) {
+      const formFactor = recentEra / leagueAvg;
+      homeLambda = homeLambda * formFactor * 0.15 + homeLambda * 0.85;
+    }
+  }
+
+  // Home field advantage
+  homeLambda *= 1.05;
+
+  homeLambda = Math.max(1.5, Math.min(9, homeLambda));
+  awayLambda = Math.max(1.5, Math.min(9, awayLambda));
+
+  let homeWins = 0;
+  let awayWins = 0;
+  let totalHomeRuns = 0;
+  let totalAwayRuns = 0;
+
+  for (let i = 0; i < MONTE_CARLO_RUNS; i++) {
+    const homeRuns = poissonRandom(homeLambda);
+    const awayRuns = poissonRandom(awayLambda);
+    totalHomeRuns += homeRuns;
+    totalAwayRuns += awayRuns;
+    if (homeRuns > awayRuns) homeWins++;
+    else if (awayRuns > homeRuns) awayWins++;
+    // ties go to extra innings — slight home advantage
+    else homeWins += 0.5;
+  }
+
+  return {
+    homeWinPct: Math.round((homeWins / MONTE_CARLO_RUNS) * 100),
+    awayWinPct: Math.round((awayWins / MONTE_CARLO_RUNS) * 100),
+    avgHomeRuns: Math.round((totalHomeRuns / MONTE_CARLO_RUNS) * 10) / 10,
+    avgAwayRuns: Math.round((totalAwayRuns / MONTE_CARLO_RUNS) * 10) / 10,
+    simulations: MONTE_CARLO_RUNS,
+  };
 }
 
 async function fetchPitcherStats(pitcherId: number): Promise<PitcherStats | null> {
@@ -141,87 +232,35 @@ async function fetchTeamBatting(teamId: number): Promise<TeamBatting | null> {
   } catch { return null; }
 }
 
-function calcPoisson(homeBatting: TeamBatting | null, awayBatting: TeamBatting | null, homePitcher: PitcherStats | null, awayPitcher: PitcherStats | null): PoissonResult | null {
-  if (!homeBatting || !awayBatting) return null;
-  const leagueAvgRuns = 4.5;
-  let homeExpected = parseFloat(homeBatting.runsPerGame) || leagueAvgRuns;
-  let awayExpected = parseFloat(awayBatting.runsPerGame) || leagueAvgRuns;
-
-  if (awayPitcher) {
-    const era = parseFloat(awayPitcher.era);
-    if (!isNaN(era)) {
-      const pitcherFactor = era / leagueAvgRuns;
-      homeExpected = homeExpected * pitcherFactor * 0.9;
-    }
-  }
-  if (homePitcher) {
-    const era = parseFloat(homePitcher.era);
-    if (!isNaN(era)) {
-      const pitcherFactor = era / leagueAvgRuns;
-      awayExpected = awayExpected * pitcherFactor * 0.9;
-    }
-  }
-
-  homeExpected = Math.max(1.5, Math.min(8, homeExpected));
-  awayExpected = Math.max(1.5, Math.min(8, awayExpected));
-
-  function poissonProb(lambda: number, k: number): number {
-    let result = Math.exp(-lambda);
-    for (let i = 1; i <= k; i++) result *= lambda / i;
-    return result;
-  }
-
-  let homeWin = 0, awayWin = 0, draw = 0;
-  const maxRuns = 15;
-  for (let h = 0; h <= maxRuns; h++) {
-    for (let a = 0; a <= maxRuns; a++) {
-      const p = poissonProb(homeExpected, h) * poissonProb(awayExpected, a);
-      if (h > a) homeWin += p;
-      else if (a > h) awayWin += p;
-      else draw += p;
-    }
-  }
-
-  const total = homeWin + awayWin + draw;
-  return {
-    homeExpected: Math.round(homeExpected * 10) / 10,
-    awayExpected: Math.round(awayExpected * 10) / 10,
-    homeWinProb: Math.round((homeWin / total) * 100),
-    awayWinProb: Math.round((awayWin / total) * 100),
-    drawProb: Math.round((draw / total) * 100),
-  };
-}
-
 function calcScore(
   hp: PitcherStats | null, ap: PitcherStats | null,
   hb: TeamBatting | null, ab: TeamBatting | null,
   hf: RecentForm | null, af: RecentForm | null,
-  poisson: PoissonResult | null
+  sim: SimulationResult | null
 ) {
   let score = 50;
 
   if (hp) {
     const era = parseFloat(hp.era);
-    if (!isNaN(era)) score += era < 3.0 ? 10 : era < 4.0 ? 5 : era < 5.0 ? 0 : -5;
+    if (!isNaN(era)) score += era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4;
     const whip = parseFloat(hp.whip);
-    if (!isNaN(whip)) score += whip < 1.1 ? 6 : whip < 1.3 ? 2 : -3;
+    if (!isNaN(whip)) score += whip < 1.1 ? 5 : whip < 1.3 ? 2 : -3;
   }
-  if (hf) score += hf.trend === "hot" ? 8 : hf.trend === "cold" ? -8 : 0;
-
+  if (hf) score += hf.trend === "hot" ? 6 : hf.trend === "cold" ? -6 : 0;
   if (ap) {
     const era = parseFloat(ap.era);
-    if (!isNaN(era)) score -= era < 3.0 ? 10 : era < 4.0 ? 5 : era < 5.0 ? 0 : -5;
+    if (!isNaN(era)) score -= era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4;
   }
-  if (af) score -= af.trend === "hot" ? 8 : af.trend === "cold" ? -8 : 0;
-
+  if (af) score -= af.trend === "hot" ? 6 : af.trend === "cold" ? -6 : 0;
   if (hb) {
     const ops = parseFloat(hb.ops);
-    if (!isNaN(ops)) score += ops > 0.800 ? 5 : ops > 0.720 ? 2 : -2;
+    if (!isNaN(ops)) score += ops > 0.800 ? 4 : ops > 0.720 ? 1 : -2;
   }
 
-  if (poisson) {
-    const poissonBias = poisson.homeWinProb - 50;
-    score += poissonBias * 0.3;
+  // Monte Carlo carries the most weight
+  if (sim) {
+    const mcBias = (sim.homeWinPct - 50) * 0.5;
+    score += mcBias;
   }
 
   score = Math.max(15, Math.min(85, score));
@@ -294,15 +333,15 @@ export default function MLBApp() {
           hpId ? fetchRecentForm(hpId) : null,
           apId ? fetchRecentForm(apId) : null,
         ]);
-        const poisson = calcPoisson(hb, ab, hp, ap);
-        const { score, rec, conf } = calcScore(hp, ap, hb, ab, hf, af, poisson);
+        const sim = runMonteCarlo(hb, ab, hp, ap, hf, af);
+        const { score, rec, conf } = calcScore(hp, ap, hb, ab, hf, af, sim);
         return {
           game,
           homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp, form: hf },
           awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap, form: af },
           homeBatting: hb,
           awayBatting: ab,
-          poisson,
+          simulation: sim,
           score, recommendation: rec, confidence: conf
         };
       }));
@@ -373,7 +412,7 @@ export default function MLBApp() {
       {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "50vh", gap: 16 }}>
           <div style={{ width: 40, height: 40, border: "3px solid #1A2535", borderTopColor: "#00E096", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-          <div style={{ color: "#4A6080", fontSize: 12 }}>Analizando juegos 2026...</div>
+          <div style={{ color: "#4A6080", fontSize: 12 }}>Ejecutando {MONTE_CARLO_RUNS.toLocaleString()} simulaciones...</div>
           <style>{`@keyframes spin { to { transform: rotate(360deg); }}`}</style>
         </div>
       ) : view === "picks" ? (
@@ -393,7 +432,7 @@ export default function MLBApp() {
 }
 
 function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; rank: number; onClick: () => void; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, score, recommendation, confidence, poisson } = analysis;
+  const { game, homePitcher, awayPitcher, score, recommendation, simulation } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.some(p => p.game_pk === game.gamePk);
@@ -425,9 +464,9 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid #1A2535" }}>
         <div style={{ fontSize: 11, color: rating.color }}>{recommendation}</div>
-        {poisson && (
+        {simulation && (
           <div style={{ fontSize: 11, color: "#4A6080" }}>
-            Poisson: <span style={{ color: "#7A9CC0" }}>{poisson.homeWinProb}%</span> local
+            MC: <span style={{ color: "#7A9CC0", fontWeight: 700 }}>{simulation.homeWinPct}%</span> local
           </div>
         )}
       </div>
@@ -436,7 +475,7 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
 }
 
 function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks }: { analysis: GameAnalysis; onBack: () => void; onSavePick: (a: GameAnalysis, pick: string) => void; savingPick: boolean; pickSaved: boolean; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, poisson, score, recommendation, confidence } = analysis;
+  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, simulation, score, recommendation, confidence } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.find(p => p.game_pk === game.gamePk);
@@ -452,24 +491,27 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
         <div style={{ fontSize: 11, color: "#4A6080", marginTop: 4 }}>{time} CT • {game.venue?.name}</div>
       </div>
 
-      {poisson && (
-        <div style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "12px 14px", marginBottom: 14 }}>
-          <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 10 }}>MODELO POISSON</div>
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
-            {[
-              ["LOCAL GANA", `${poisson.homeWinProb}%`, "#00E096"],
-              ["EMPATE", `${poisson.drawProb}%`, "#FFD84D"],
-              ["VISITANTE", `${poisson.awayWinProb}%`, "#FF9F43"]
-            ].map(([l, v, c]) => (
-              <div key={l} style={{ background: "#080C14", borderRadius: 8, padding: "8px", textAlign: "center" }}>
-                <div style={{ fontSize: 9, color: "#4A6080" }}>{l}</div>
-                <div style={{ fontSize: 18, fontWeight: 700, color: c, marginTop: 2 }}>{v}</div>
-              </div>
-            ))}
+      {simulation && (
+        <div style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "14px", marginBottom: 14 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+            <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em" }}>MONTE CARLO — {simulation.simulations.toLocaleString()} SIMULACIONES</div>
           </div>
-          <div style={{ display: "flex", justifyContent: "space-around", fontSize: 11, color: "#4A6080" }}>
-            <span>Carreras esperadas local: <strong style={{ color: "#E8EDF5" }}>{poisson.homeExpected}</strong></span>
-            <span>Visitante: <strong style={{ color: "#E8EDF5" }}>{poisson.awayExpected}</strong></span>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+            <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.homeWinPct > simulation.awayWinPct ? "#00E09640" : "#1A2535"}` }}>
+              <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 4 }}>LOCAL GANA</div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: simulation.homeWinPct > simulation.awayWinPct ? "#00E096" : "#7A9CC0" }}>{simulation.homeWinPct}%</div>
+              <div style={{ fontSize: 10, color: "#4A6080", marginTop: 4 }}>~{simulation.avgHomeRuns} carreras</div>
+            </div>
+            <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.awayWinPct > simulation.homeWinPct ? "#FF9F4340" : "#1A2535"}` }}>
+              <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 4 }}>VISITANTE GANA</div>
+              <div style={{ fontSize: 28, fontWeight: 700, color: simulation.awayWinPct > simulation.homeWinPct ? "#FF9F43" : "#7A9CC0" }}>{simulation.awayWinPct}%</div>
+              <div style={{ fontSize: 10, color: "#4A6080", marginTop: 4 }}>~{simulation.avgAwayRuns} carreras</div>
+            </div>
+          </div>
+          <div style={{ background: "#080C14", borderRadius: 6, padding: "6px 10px", textAlign: "center" }}>
+            <div style={{ fontSize: 10, color: "#4A6080" }}>
+              Marcador más probable: <strong style={{ color: "#E8EDF5" }}>{simulation.avgHomeRuns} - {simulation.avgAwayRuns}</strong> a favor del {simulation.homeWinPct > simulation.awayWinPct ? "local" : "visitante"}
+            </div>
           </div>
         </div>
       )}

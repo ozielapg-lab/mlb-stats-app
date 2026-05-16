@@ -37,6 +37,7 @@ interface GameAnalysis {
 
 interface Pick {
   id: number;
+  game_pk: number;
   created_at: string;
   game_date: string;
   home_team: string;

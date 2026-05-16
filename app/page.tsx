@@ -3,7 +3,6 @@ import { useEffect, useState } from "react";
 
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SUPABASE_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
-
 const MLB_API = "https://statsapi.mlb.com/api/v1";
 
 interface Game {
@@ -22,12 +21,18 @@ interface PitcherStats {
   baseOnBalls: string; inningsPitched: string; wins: string; losses: string;
 }
 
+interface RecentForm {
+  recentEra: string;
+  trend: "hot" | "cold" | "neutral";
+  lastStarts: number;
+}
+
 interface TeamStats { avg: string; ops: string; runs: string; homeRuns: string; }
 
 interface GameAnalysis {
   game: Game;
-  homePitcher: { name: string; stats: PitcherStats | null };
-  awayPitcher: { name: string; stats: PitcherStats | null };
+  homePitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
+  awayPitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
   homeTeamStats: TeamStats | null;
   awayTeamStats: TeamStats | null;
   score: number;
@@ -61,6 +66,27 @@ async function fetchPitcherStats(pitcherId: number): Promise<PitcherStats | null
   } catch { return null; }
 }
 
+async function fetchRecentForm(pitcherId: number): Promise<RecentForm | null> {
+  try {
+    const res = await fetch(`${MLB_API}/people/${pitcherId}/stats?stats=gameLog&season=2025&group=pitching`);
+    const data = await res.json();
+    const splits = data.stats?.[0]?.splits ?? [];
+    const last5 = splits.slice(-5);
+    if (!last5.length) return null;
+    let totalER = 0, totalIP = 0;
+    for (const g of last5) {
+      const ip = parseFloat(g.stat.inningsPitched ?? "0");
+      const er = parseFloat(g.stat.earnedRuns ?? "0");
+      totalER += er;
+      totalIP += ip;
+    }
+    const recentEra = totalIP > 0 ? ((totalER * 9) / totalIP).toFixed(2) : "N/A";
+    const recentEraNum = parseFloat(recentEra);
+    const trend = recentEraNum < 3.0 ? "hot" : recentEraNum > 5.0 ? "cold" : "neutral";
+    return { recentEra, trend, lastStarts: last5.length };
+  } catch { return null; }
+}
+
 async function fetchTeamStats(teamId: number): Promise<TeamStats | null> {
   try {
     const res = await fetch(`${MLB_API}/teams/${teamId}/stats?stats=season&season=2025&group=hitting`);
@@ -72,12 +98,31 @@ async function fetchTeamStats(teamId: number): Promise<TeamStats | null> {
   } catch { return null; }
 }
 
-function calcScore(hp: PitcherStats | null, ap: PitcherStats | null, ht: TeamStats | null, at: TeamStats | null) {
+function calcScore(hp: PitcherStats | null, ap: PitcherStats | null, ht: TeamStats | null, at: TeamStats | null, hf: RecentForm | null, af: RecentForm | null) {
   let score = 50;
-  if (hp) { const era = parseFloat(hp.era); if (!isNaN(era)) score += era < 3.0 ? 15 : era < 4.0 ? 8 : era < 5.0 ? 0 : -8; const whip = parseFloat(hp.whip); if (!isNaN(whip)) score += whip < 1.1 ? 10 : whip < 1.3 ? 4 : -5; }
-  if (ap) { const era = parseFloat(ap.era); if (!isNaN(era)) score -= era < 3.0 ? 15 : era < 4.0 ? 8 : era < 5.0 ? 0 : -8; }
-  if (ht) { const ops = parseFloat(ht.ops); if (!isNaN(ops)) score += ops > 0.800 ? 8 : ops > 0.720 ? 3 : -3; }
-  score = Math.max(20, Math.min(80, score));
+  if (hp) {
+    const era = parseFloat(hp.era);
+    if (!isNaN(era)) score += era < 3.0 ? 12 : era < 4.0 ? 6 : era < 5.0 ? 0 : -6;
+    const whip = parseFloat(hp.whip);
+    if (!isNaN(whip)) score += whip < 1.1 ? 8 : whip < 1.3 ? 3 : -4;
+  }
+  if (hf) {
+    if (hf.trend === "hot") score += 10;
+    else if (hf.trend === "cold") score -= 10;
+  }
+  if (ap) {
+    const era = parseFloat(ap.era);
+    if (!isNaN(era)) score -= era < 3.0 ? 12 : era < 4.0 ? 6 : era < 5.0 ? 0 : -6;
+  }
+  if (af) {
+    if (af.trend === "hot") score -= 10;
+    else if (af.trend === "cold") score += 10;
+  }
+  if (ht) {
+    const ops = parseFloat(ht.ops);
+    if (!isNaN(ops)) score += ops > 0.800 ? 6 : ops > 0.720 ? 2 : -2;
+  }
+  score = Math.max(15, Math.min(85, score));
   const rec = score >= 62 ? "✅ Local favorito" : score <= 38 ? "⚠️ Visitante ventaja" : "➡️ Partido parejo";
   return { score, rec, conf: Math.round(Math.abs(score - 50) * 2) };
 }
@@ -90,9 +135,16 @@ function getRating(score: number) {
   return { color: "#FF6B6B", label: "EVITAR" };
 }
 
+function getTrendEmoji(form: RecentForm | null) {
+  if (!form) return "";
+  if (form.trend === "hot") return "🔥";
+  if (form.trend === "cold") return "📉";
+  return "➡️";
+}
+
 async function dbGet(): Promise<Pick[]> {
   try {
-    const res = await fetch(`${SUPABASE_URL}/rest/v1/picks?select=*&order=created_at.desc`, {
+    const res = await fetch(`${SUPABASE_URL}/rest/v1/picks?select=*&order=game_pk.desc`, {
       headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${SUPABASE_KEY}`, Accept: "application/json" }
     });
     const data = await res.json();
@@ -132,14 +184,23 @@ export default function MLBApp() {
       const data = await res.json();
       const gameList: Game[] = data.dates?.[0]?.games ?? [];
       const analyses: GameAnalysis[] = await Promise.all(gameList.map(async (game) => {
-        const [hp, ap, ht, at] = await Promise.all([
-          game.teams.home.probablePitcher?.id ? fetchPitcherStats(game.teams.home.probablePitcher.id) : null,
-          game.teams.away.probablePitcher?.id ? fetchPitcherStats(game.teams.away.probablePitcher.id) : null,
+        const hpId = game.teams.home.probablePitcher?.id;
+        const apId = game.teams.away.probablePitcher?.id;
+        const [hp, ap, ht, at, hf, af] = await Promise.all([
+          hpId ? fetchPitcherStats(hpId) : null,
+          apId ? fetchPitcherStats(apId) : null,
           fetchTeamStats(game.teams.home.team.id),
           fetchTeamStats(game.teams.away.team.id),
+          hpId ? fetchRecentForm(hpId) : null,
+          apId ? fetchRecentForm(apId) : null,
         ]);
-        const { score, rec, conf } = calcScore(hp, ap, ht, at);
-        return { game, homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp }, awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap }, homeTeamStats: ht, awayTeamStats: at, score, recommendation: rec, confidence: conf };
+        const { score, rec, conf } = calcScore(hp, ap, ht, at, hf, af);
+        return {
+          game,
+          homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp, form: hf },
+          awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap, form: af },
+          homeTeamStats: ht, awayTeamStats: at, score, recommendation: rec, confidence: conf
+        };
       }));
       setGames(analyses.sort((a, b) => b.score - a.score));
       setLoading(false);
@@ -208,7 +269,7 @@ export default function MLBApp() {
       {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "50vh", gap: 16 }}>
           <div style={{ width: 40, height: 40, border: "3px solid #1A2535", borderTopColor: "#00E096", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-          <div style={{ color: "#4A6080", fontSize: 12 }}>Analizando juegos...</div>
+          <div style={{ color: "#4A6080", fontSize: 12 }}>Analizando juegos y forma reciente...</div>
           <style>{`@keyframes spin { to { transform: rotate(360deg); }}`}</style>
         </div>
       ) : view === "picks" ? (
@@ -232,15 +293,17 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.some(p => p.game_pk === game.gamePk);
+  const homeTrend = getTrendEmoji(homePitcher.form);
+  const awayTrend = getTrendEmoji(awayPitcher.form);
 
   return (
     <div onClick={onClick} style={{ background: "#0D1520", border: `1px solid ${rank <= 3 ? rating.color + "40" : "#1A2535"}`, borderRadius: 10, padding: "12px 14px", cursor: "pointer", position: "relative", overflow: "hidden" }}>
       {rank <= 3 && <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: `linear-gradient(90deg, ${rating.color}, transparent)` }} />}
-      {alreadyPicked && <div style={{ position: "absolute", top: 8, right: 8, fontSize: 10, color: "#00E096", background: "#00E09615", border: "1px solid #00E09640", borderRadius: 4, padding: "1px 6px" }}>✓ PICK</div>}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <div style={{ width: 20, height: 20, borderRadius: 4, background: "#1A2535", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#4A6080", fontWeight: 700 }}>#{rank}</div>
           <div style={{ fontSize: 11, color: "#4A6080" }}>{time} CT</div>
+          {alreadyPicked && <div style={{ fontSize: 10, color: "#00E096", background: "#00E09615", border: "1px solid #00E09640", borderRadius: 4, padding: "1px 5px" }}>✓</div>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <div style={{ fontSize: 10, color: rating.color, fontWeight: 700 }}>{rating.label}</div>
@@ -248,14 +311,14 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
         </div>
       </div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-        <div style={{ flex: 1 }}>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{game.teams.away.team.name}</div>
-          <div style={{ fontSize: 11, color: "#4A6080" }}>🔴 {awayPitcher.name}</div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{game.teams.away.team.name}</div>
+          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>🔴 {awayPitcher.name} {awayTrend}</div>
         </div>
-        <div style={{ padding: "0 10px", color: "#4A6080", fontSize: 11 }}>VS</div>
-        <div style={{ flex: 1, textAlign: "right" }}>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{game.teams.home.team.name}</div>
-          <div style={{ fontSize: 11, color: "#4A6080" }}>{homePitcher.name} 🏠</div>
+        <div style={{ padding: "0 8px", color: "#4A6080", fontSize: 10, flexShrink: 0 }}>VS</div>
+        <div style={{ flex: 1, minWidth: 0, textAlign: "right" }}>
+          <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{game.teams.home.team.name}</div>
+          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{homeTrend} {homePitcher.name} 🏠</div>
         </div>
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid #1A2535" }}>
@@ -291,11 +354,11 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
           <div style={{ fontSize: 11, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 8 }}>REGISTRAR MI PICK</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
             <button onClick={() => onSavePick(analysis, game.teams.home.team.name)} disabled={savingPick}
-              style={{ padding: "10px", borderRadius: 8, border: "1px solid #1D9E7540", background: "#1D9E7515", color: "#00E096", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
+              style={{ padding: "10px 6px", borderRadius: 8, border: "1px solid #1D9E7540", background: "#1D9E7515", color: "#00E096", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
               🏠 {game.teams.home.team.name}
             </button>
             <button onClick={() => onSavePick(analysis, game.teams.away.team.name)} disabled={savingPick}
-              style={{ padding: "10px", borderRadius: 8, border: "1px solid #4A608040", background: "#1A2535", color: "#7A9CC0", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
+              style={{ padding: "10px 6px", borderRadius: 8, border: "1px solid #4A608040", background: "#1A2535", color: "#7A9CC0", cursor: "pointer", fontSize: 11, fontWeight: 600 }}>
               🔴 {game.teams.away.team.name}
             </button>
           </div>
@@ -309,15 +372,23 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
           { label: "LOCAL", pitcher: homePitcher, team: homeTeamStats, emoji: "🏠", teamName: game.teams.home.team.name }
         ].map(({ label, pitcher, team, emoji, teamName }) => (
           <div key={label} style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: 12 }}>
-            <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 6 }}>{label}</div>
-            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8 }}>{teamName}</div>
-            <div style={{ fontSize: 11, color: "#7A9CC0", marginBottom: 8 }}>{emoji} {pitcher.name}</div>
+            <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 4 }}>{label}</div>
+            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{teamName}</div>
+            <div style={{ fontSize: 11, color: "#7A9CC0", marginBottom: 8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{emoji} {pitcher.name}</div>
+            {pitcher.form && (
+              <div style={{ marginBottom: 8, padding: "6px 8px", borderRadius: 6, background: pitcher.form.trend === "hot" ? "#00E09615" : pitcher.form.trend === "cold" ? "#FF6B6B15" : "#1A2535", border: `1px solid ${pitcher.form.trend === "hot" ? "#00E09640" : pitcher.form.trend === "cold" ? "#FF6B6B40" : "#1A2535"}` }}>
+                <div style={{ fontSize: 9, color: "#4A6080" }}>ÚLTIMAS {pitcher.form.lastStarts} SALIDAS</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: pitcher.form.trend === "hot" ? "#00E096" : pitcher.form.trend === "cold" ? "#FF6B6B" : "#FFD84D" }}>
+                  ERA {pitcher.form.recentEra} {getTrendEmoji(pitcher.form)}
+                </div>
+              </div>
+            )}
             {pitcher.stats ? (
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
                 {[["ERA", pitcher.stats.era], ["WHIP", pitcher.stats.whip], ["K", pitcher.stats.strikeOuts], ["BB", pitcher.stats.baseOnBalls]].map(([l, v]) => (
                   <div key={l} style={{ background: "#080C14", borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
-                    <div style={{ fontSize: 9, color: "#4A6080" }}>{l}</div>
-                    <div style={{ fontSize: 15, fontWeight: 700 }}>{v}</div>
+                    <div style={{ fontSize: 9, color: "#4A6080" }}>{l} temp.</div>
+                    <div style={{ fontSize: 14, fontWeight: 700 }}>{v}</div>
                   </div>
                 ))}
               </div>
@@ -328,7 +399,7 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
                   {[["AVG", team.avg], ["OPS", team.ops]].map(([l, v]) => (
                     <div key={l} style={{ background: "#080C14", borderRadius: 6, padding: "6px 8px", textAlign: "center" }}>
                       <div style={{ fontSize: 9, color: "#4A6080" }}>{l}</div>
-                      <div style={{ fontSize: 15, fontWeight: 700 }}>{v}</div>
+                      <div style={{ fontSize: 14, fontWeight: 700 }}>{v}</div>
                     </div>
                   ))}
                 </div>

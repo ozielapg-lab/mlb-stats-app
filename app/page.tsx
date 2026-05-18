@@ -10,7 +10,7 @@ const MONTE_CARLO_RUNS = 10000;
 interface Game {
   gamePk: number;
   gameDate: string;
-  status: { detailedState: string };
+  status: { detailedState: string; abstractGameState: string };
   teams: {
     away: { team: { id: number; name: string }; probablePitcher?: { id: number; fullName: string } };
     home: { team: { id: number; name: string }; probablePitcher?: { id: number; fullName: string } };
@@ -36,6 +36,11 @@ interface RecentForm {
   lastStarts: number;
 }
 
+interface PitcherRole {
+  isStarter: boolean;
+  position: string;
+}
+
 interface TeamBatting {
   avg: string;
   ops: string;
@@ -56,14 +61,15 @@ interface SimulationResult {
 
 interface GameAnalysis {
   game: Game;
-  homePitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
-  awayPitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null };
+  homePitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null; role: PitcherRole | null };
+  awayPitcher: { name: string; stats: PitcherStats | null; form: RecentForm | null; role: PitcherRole | null };
   homeBatting: TeamBatting | null;
   awayBatting: TeamBatting | null;
   simulation: SimulationResult | null;
   score: number;
   recommendation: string;
   confidence: number;
+  isLocked: boolean;
 }
 
 interface Pick {
@@ -82,8 +88,7 @@ interface Pick {
 
 function poissonRandom(lambda: number): number {
   const L = Math.exp(-lambda);
-  let k = 0;
-  let p = 1;
+  let k = 0, p = 1;
   do { k++; p *= Math.random(); } while (p > L);
   return k - 1;
 }
@@ -91,30 +96,44 @@ function poissonRandom(lambda: number): number {
 function runMonteCarlo(
   homeBatting: TeamBatting | null, awayBatting: TeamBatting | null,
   homePitcher: PitcherStats | null, awayPitcher: PitcherStats | null,
-  homeForm: RecentForm | null, awayForm: RecentForm | null
+  homeForm: RecentForm | null, awayForm: RecentForm | null,
+  homeIsStarter: boolean, awayIsStarter: boolean
 ): SimulationResult | null {
   if (!homeBatting || !awayBatting) return null;
   const leagueAvg = 4.5;
   let homeLambda = parseFloat(homeBatting.runsPerGame) || leagueAvg;
   let awayLambda = parseFloat(awayBatting.runsPerGame) || leagueAvg;
 
+  // Adjust by opposing pitcher ERA — less weight if reliever
   if (awayPitcher) {
     const era = parseFloat(awayPitcher.era);
-    if (!isNaN(era) && era > 0) homeLambda = homeLambda * (era / leagueAvg) * 0.85;
+    if (!isNaN(era) && era > 0) {
+      const weight = awayIsStarter ? 0.85 : 0.4;
+      homeLambda = homeLambda * (era / leagueAvg) * weight + homeLambda * (1 - weight);
+    }
   }
   if (homePitcher) {
     const era = parseFloat(homePitcher.era);
-    if (!isNaN(era) && era > 0) awayLambda = awayLambda * (era / leagueAvg) * 0.85;
+    if (!isNaN(era) && era > 0) {
+      const weight = homeIsStarter ? 0.85 : 0.4;
+      awayLambda = awayLambda * (era / leagueAvg) * weight + awayLambda * (1 - weight);
+    }
   }
-  if (homeForm) {
+
+  // Recent form adjustment
+  if (homeForm && homeIsStarter) {
     const re = parseFloat(homeForm.recentEra);
     if (!isNaN(re) && re > 0) awayLambda = awayLambda * (re / leagueAvg) * 0.15 + awayLambda * 0.85;
   }
-  if (awayForm) {
+  if (awayForm && awayIsStarter) {
     const re = parseFloat(awayForm.recentEra);
     if (!isNaN(re) && re > 0) homeLambda = homeLambda * (re / leagueAvg) * 0.15 + homeLambda * 0.85;
   }
-  homeLambda = Math.max(1.5, Math.min(9, homeLambda * 1.05));
+
+  // Home field advantage — reduced from 1.05 to 1.02
+  homeLambda *= 1.02;
+
+  homeLambda = Math.max(1.5, Math.min(9, homeLambda));
   awayLambda = Math.max(1.5, Math.min(9, awayLambda));
 
   let homeWins = 0, awayWins = 0, totalHomeRuns = 0, totalAwayRuns = 0;
@@ -126,6 +145,7 @@ function runMonteCarlo(
     else if (a > h) awayWins++;
     else homeWins += 0.5;
   }
+
   return {
     homeWinPct: Math.round((homeWins / MONTE_CARLO_RUNS) * 100),
     awayWinPct: Math.round((awayWins / MONTE_CARLO_RUNS) * 100),
@@ -161,6 +181,17 @@ async function fetchRecentForm(pitcherId: number): Promise<RecentForm | null> {
   } catch { return null; }
 }
 
+async function fetchPitcherRole(pitcherId: number): Promise<PitcherRole | null> {
+  try {
+    const res = await fetch(`${MLB_API}/people/${pitcherId}?hydrate=currentTeam`);
+    const data = await res.json();
+    const person = data.people?.[0];
+    if (!person) return null;
+    const pos = person.primaryPosition?.abbreviation ?? "P";
+    return { isStarter: pos === "SP", position: pos };
+  } catch { return null; }
+}
+
 async function fetchTeamBatting(teamId: number): Promise<TeamBatting | null> {
   try {
     const res = await fetch(`${MLB_API}/teams/${teamId}/stats?stats=season&season=${SEASON}&group=hitting`);
@@ -174,30 +205,73 @@ async function fetchTeamBatting(teamId: number): Promise<TeamBatting | null> {
   } catch { return null; }
 }
 
-function calcScore(hp: PitcherStats | null, ap: PitcherStats | null, hb: TeamBatting | null, ab: TeamBatting | null, hf: RecentForm | null, af: RecentForm | null, sim: SimulationResult | null) {
-  let score = 50;
-  if (hp) { const era = parseFloat(hp.era); if (!isNaN(era)) score += era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4; const whip = parseFloat(hp.whip); if (!isNaN(whip)) score += whip < 1.1 ? 5 : whip < 1.3 ? 2 : -3; }
-  if (hf) score += hf.trend === "hot" ? 6 : hf.trend === "cold" ? -6 : 0;
-  if (ap) { const era = parseFloat(ap.era); if (!isNaN(era)) score -= era < 3.0 ? 8 : era < 4.0 ? 4 : era < 5.0 ? 0 : -4; }
-  if (af) score -= af.trend === "hot" ? 6 : af.trend === "cold" ? -6 : 0;
-  if (hb) { const ops = parseFloat(hb.ops); if (!isNaN(ops)) score += ops > 0.800 ? 4 : ops > 0.720 ? 1 : -2; }
-  if (sim) score += (sim.homeWinPct - 50) * 0.5;
-  score = Math.max(15, Math.min(85, score));
-  const rec = score >= 62 ? "✅ Local favorito" : score <= 38 ? "⚠️ Visitante ventaja" : "➡️ Partido parejo";
-  return { score: Math.round(score), rec, conf: Math.round(Math.abs(score - 50) * 2) };
+function calcScore(
+  sim: SimulationResult | null,
+  hf: RecentForm | null, af: RecentForm | null,
+  hb: TeamBatting | null, ab: TeamBatting | null,
+  hp: PitcherStats | null, ap: PitcherStats | null,
+  homeIsStarter: boolean, awayIsStarter: boolean
+) {
+  // MC carries 50% of the score
+  let mcScore = 50;
+  if (sim) mcScore = sim.homeWinPct;
+
+  // Recent form — 20% weight, only for starters
+  let formScore = 50;
+  if (hf && homeIsStarter) formScore += hf.trend === "hot" ? 15 : hf.trend === "cold" ? -15 : 0;
+  if (af && awayIsStarter) formScore -= af.trend === "hot" ? 15 : af.trend === "cold" ? -15 : 0;
+  formScore = Math.max(0, Math.min(100, formScore));
+
+  // OPS differential — 15% weight
+  let opsScore = 50;
+  if (hb && ab) {
+    const hOps = parseFloat(hb.ops);
+    const aOps = parseFloat(ab.ops);
+    if (!isNaN(hOps) && !isNaN(aOps)) {
+      const diff = (hOps - aOps) * 200;
+      opsScore = Math.max(0, Math.min(100, 50 + diff));
+    }
+  }
+
+  // ERA differential — 15% weight, only for starters
+  let eraScore = 50;
+  if (hp && ap && homeIsStarter && awayIsStarter) {
+    const hEra = parseFloat(hp.era);
+    const aEra = parseFloat(ap.era);
+    if (!isNaN(hEra) && !isNaN(aEra)) {
+      const diff = (aEra - hEra) * 8;
+      eraScore = Math.max(0, Math.min(100, 50 + diff));
+    }
+  }
+
+  // Weighted average
+  const score = (mcScore * 0.50) + (formScore * 0.20) + (opsScore * 0.15) + (eraScore * 0.15);
+  const rounded = Math.round(Math.max(15, Math.min(85, score)));
+  const rec = rounded >= 62 ? "✅ Local favorito" : rounded <= 38 ? "⚠️ Visitante ventaja" : "➡️ Partido parejo";
+  return { score: rounded, rec, conf: Math.round(Math.abs(rounded - 50) * 2) };
 }
 
 function getRating(score: number) {
-  if (score >= 65) return { color: "#00E096", label: "FUERTE" };
-  if (score >= 58) return { color: "#7DF9A6", label: "BUENO" };
+  if (score >= 68) return { color: "#00E096", label: "FUERTE" };
+  if (score >= 60) return { color: "#7DF9A6", label: "BUENO" };
   if (score >= 45) return { color: "#FFD84D", label: "NEUTRO" };
   if (score >= 35) return { color: "#FF9F43", label: "DÉBIL" };
   return { color: "#FF6B6B", label: "EVITAR" };
 }
 
+function getMCRating(pct: number) {
+  if (pct >= 85) return { color: "#00E096", label: "ALTA" };
+  if (pct >= 75) return { color: "#FFD84D", label: "MEDIA" };
+  return { color: "#FF6B6B", label: "BAJA" };
+}
+
 function getTrendEmoji(form: RecentForm | null) {
   if (!form) return "";
   return form.trend === "hot" ? "🔥" : form.trend === "cold" ? "📉" : "➡️";
+}
+
+function isGameLive(game: Game): boolean {
+  return game.status.abstractGameState === "Live" || game.status.abstractGameState === "Final";
 }
 
 async function dbGet(): Promise<Pick[]> {
@@ -241,27 +315,39 @@ export default function MLBApp() {
       const res = await fetch(`${MLB_API}/schedule?sportId=1&date=${today}&hydrate=probablePitcher`);
       const data = await res.json();
       const gameList: Game[] = data.dates?.[0]?.games ?? [];
+
       const analyses: GameAnalysis[] = await Promise.all(gameList.map(async (game) => {
         const hpId = game.teams.home.probablePitcher?.id;
         const apId = game.teams.away.probablePitcher?.id;
-        const [hp, ap, hb, ab, hf, af] = await Promise.all([
+
+        const [hp, ap, hb, ab, hf, af, hRole, aRole] = await Promise.all([
           hpId ? fetchPitcherStats(hpId) : null,
           apId ? fetchPitcherStats(apId) : null,
           fetchTeamBatting(game.teams.home.team.id),
           fetchTeamBatting(game.teams.away.team.id),
           hpId ? fetchRecentForm(hpId) : null,
           apId ? fetchRecentForm(apId) : null,
+          hpId ? fetchPitcherRole(hpId) : null,
+          apId ? fetchPitcherRole(apId) : null,
         ]);
-        const sim = runMonteCarlo(hb, ab, hp, ap, hf, af);
-        const { score, rec, conf } = calcScore(hp, ap, hb, ab, hf, af, sim);
+
+        const homeIsStarter = hRole?.isStarter ?? true;
+        const awayIsStarter = aRole?.isStarter ?? true;
+        const locked = isGameLive(game);
+
+        const sim = runMonteCarlo(hb, ab, hp, ap, hf, af, homeIsStarter, awayIsStarter);
+        const { score, rec, conf } = calcScore(sim, hf, af, hb, ab, hp, ap, homeIsStarter, awayIsStarter);
+
         return {
           game,
-          homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp, form: hf },
-          awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap, form: af },
+          homePitcher: { name: game.teams.home.probablePitcher?.fullName ?? "Por confirmar", stats: hp, form: hf, role: hRole },
+          awayPitcher: { name: game.teams.away.probablePitcher?.fullName ?? "Por confirmar", stats: ap, form: af, role: aRole },
           homeBatting: hb, awayBatting: ab, simulation: sim,
-          score, recommendation: rec, confidence: conf
+          score, recommendation: rec, confidence: conf,
+          isLocked: locked
         };
       }));
+
       setGames(analyses.sort((a, b) => b.score - a.score));
       setLoading(false);
     }
@@ -299,6 +385,7 @@ export default function MLBApp() {
   const wins = picks.filter(p => p.result === "W").length;
   const losses = picks.filter(p => p.result === "L").length;
   const winRate = wins + losses > 0 ? Math.round((wins / (wins + losses)) * 100) : 0;
+  const strongPicks = games.filter(g => g.simulation && (g.simulation.homeWinPct >= 85 || g.simulation.awayWinPct >= 85) && !g.isLocked).length;
 
   return (
     <div style={{ minHeight: "100vh", background: "#080C14", color: "#E8EDF5", fontFamily: "'DM Mono', 'Courier New', monospace" }}>
@@ -308,11 +395,11 @@ export default function MLBApp() {
             <div style={{ width: 32, height: 32, borderRadius: 8, background: "linear-gradient(135deg, #C8102E, #002D72)", display: "flex", alignItems: "center", justifyContent: "center" }}>⚾</div>
             <div>
               <div style={{ fontSize: 15, fontWeight: 700, letterSpacing: "0.08em" }}>MLB STATS</div>
-              <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em" }}>ANÁLISIS DE APUESTAS • {SEASON}</div>
+              <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em" }}>ANÁLISIS DE APUESTAS • {SEASON} • V3</div>
             </div>
           </div>
           <div style={{ fontSize: 11, color: "#4A6080", textAlign: "right" }}>
-            <div style={{ color: "#00E096" }}>{games.length} juegos</div>
+            <div style={{ color: "#00E096" }}>{strongPicks} picks fuertes hoy</div>
             <div>{wins}W {losses}L {winRate > 0 ? `${winRate}%` : ""}</div>
           </div>
         </div>
@@ -329,7 +416,7 @@ export default function MLBApp() {
       {loading ? (
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "50vh", gap: 16 }}>
           <div style={{ width: 40, height: 40, border: "3px solid #1A2535", borderTopColor: "#00E096", borderRadius: "50%", animation: "spin 0.8s linear infinite" }} />
-          <div style={{ color: "#4A6080", fontSize: 12 }}>Ejecutando {MONTE_CARLO_RUNS.toLocaleString()} simulaciones...</div>
+          <div style={{ color: "#4A6080", fontSize: 12 }}>Analizando juegos y verificando pitchers...</div>
           <style>{`@keyframes spin { to { transform: rotate(360deg); }}`}</style>
         </div>
       ) : view === "picks" ? (
@@ -349,19 +436,21 @@ export default function MLBApp() {
 }
 
 function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; rank: number; onClick: () => void; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, score, recommendation, simulation } = analysis;
+  const { game, homePitcher, awayPitcher, score, recommendation, simulation, isLocked } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.some(p => p.game_pk === game.gamePk);
+  const isStrong = simulation && (simulation.homeWinPct >= 85 || simulation.awayWinPct >= 85);
 
   return (
-    <div onClick={onClick} style={{ background: "#0D1520", border: `1px solid ${rank <= 3 ? rating.color + "40" : "#1A2535"}`, borderRadius: 10, padding: "12px 14px", cursor: "pointer", position: "relative", overflow: "hidden" }}>
-      {rank <= 3 && <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: `linear-gradient(90deg, ${rating.color}, transparent)` }} />}
+    <div onClick={onClick} style={{ background: "#0D1520", border: `1px solid ${isStrong && !isLocked ? rating.color + "60" : rank <= 3 ? rating.color + "30" : "#1A2535"}`, borderRadius: 10, padding: "12px 14px", cursor: "pointer", position: "relative", overflow: "hidden", opacity: isLocked ? 0.7 : 1 }}>
+      {isStrong && !isLocked && <div style={{ position: "absolute", top: 0, left: 0, right: 0, height: 2, background: `linear-gradient(90deg, ${rating.color}, transparent)` }} />}
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <div style={{ width: 20, height: 20, borderRadius: 4, background: "#1A2535", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 10, color: "#4A6080", fontWeight: 700 }}>#{rank}</div>
-          <div style={{ fontSize: 11, color: "#4A6080" }}>{time} CT</div>
+          <div style={{ fontSize: 11, color: isLocked ? "#FF6B6B" : "#4A6080" }}>{isLocked ? "🔒 En curso" : `${time} CT`}</div>
           {alreadyPicked && <div style={{ fontSize: 10, color: "#00E096", background: "#00E09615", border: "1px solid #00E09640", borderRadius: 4, padding: "1px 5px" }}>✓</div>}
+          {isStrong && !isLocked && <div style={{ fontSize: 10, color: "#00E096", background: "#00E09615", border: "1px solid #00E09640", borderRadius: 4, padding: "1px 5px" }}>⭐ PICK</div>}
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
           <div style={{ fontSize: 10, color: rating.color, fontWeight: 700 }}>{rating.label}</div>
@@ -371,48 +460,65 @@ function GameCard({ analysis, rank, onClick, picks }: { analysis: GameAnalysis; 
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{game.teams.away.team.name}</div>
-          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>🔴 {awayPitcher.name} {getTrendEmoji(awayPitcher.form)}</div>
+          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            🔴 {awayPitcher.name} {getTrendEmoji(awayPitcher.form)}
+            {awayPitcher.role && !awayPitcher.role.isStarter && <span style={{ color: "#FF9F43", marginLeft: 4 }}>⚠️RP</span>}
+          </div>
         </div>
         <div style={{ padding: "0 8px", color: "#4A6080", fontSize: 10, flexShrink: 0 }}>VS</div>
         <div style={{ flex: 1, minWidth: 0, textAlign: "right" }}>
           <div style={{ fontSize: 13, fontWeight: 700, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{game.teams.home.team.name}</div>
-          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{getTrendEmoji(homePitcher.form)} {homePitcher.name} 🏠</div>
+          <div style={{ fontSize: 11, color: "#4A6080", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+            {homePitcher.role && !homePitcher.role.isStarter && <span style={{ color: "#FF9F43", marginRight: 4 }}>⚠️RP</span>}
+            {getTrendEmoji(homePitcher.form)} {homePitcher.name} 🏠
+          </div>
         </div>
       </div>
       <div style={{ display: "flex", justifyContent: "space-between", paddingTop: 6, borderTop: "1px solid #1A2535" }}>
         <div style={{ fontSize: 11, color: rating.color }}>{recommendation}</div>
-        {simulation && <div style={{ fontSize: 11, color: "#4A6080" }}>MC: <span style={{ color: "#7A9CC0", fontWeight: 700 }}>{simulation.homeWinPct}%</span> local</div>}
+        {simulation && (
+          <div style={{ fontSize: 11, color: "#4A6080" }}>
+            MC: <span style={{ color: getMCRating(Math.max(simulation.homeWinPct, simulation.awayWinPct)).color, fontWeight: 700 }}>
+              {simulation.homeWinPct}%
+            </span> local
+          </div>
+        )}
       </div>
     </div>
   );
 }
 
 function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks }: { analysis: GameAnalysis; onBack: () => void; onSavePick: (a: GameAnalysis, pick: string) => void; savingPick: boolean; pickSaved: boolean; picks: Pick[] }) {
-  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, simulation, score, recommendation } = analysis;
+  const { game, homePitcher, awayPitcher, homeBatting, awayBatting, simulation, score, recommendation, isLocked } = analysis;
   const rating = getRating(score);
   const time = new Date(game.gameDate).toLocaleTimeString("es-MX", { hour: "2-digit", minute: "2-digit", timeZone: "America/Monterrey" });
   const alreadyPicked = picks.find(p => p.game_pk === game.gamePk);
+  const isStrong = simulation && (simulation.homeWinPct >= 85 || simulation.awayWinPct >= 85);
 
   return (
     <div style={{ padding: "16px 20px" }}>
       <button onClick={onBack} style={{ background: "none", border: "1px solid #1A2535", borderRadius: 8, color: "#7A9CC0", padding: "6px 12px", cursor: "pointer", fontSize: 12, marginBottom: 16 }}>← Volver</button>
+
       <div style={{ background: `linear-gradient(135deg, ${rating.color}15, #0D1520)`, border: `1px solid ${rating.color}40`, borderRadius: 12, padding: "16px", marginBottom: 14, textAlign: "center" }}>
-        <div style={{ fontSize: 44, fontWeight: 700, color: rating.color, lineHeight: 1 }}>{score}</div>
-        <div style={{ fontSize: 12, color: "#7A9CC0", marginTop: 4 }}>Score de análisis</div>
+        <div style={{ fontSize: 44, fontWeight: 700, color: rating.color, lineHeight: 1 }}>
+          {score} {isLocked ? "🔒" : ""}
+        </div>
+        <div style={{ fontSize: 12, color: "#7A9CC0", marginTop: 4 }}>{isLocked ? "Score bloqueado — juego en curso" : "Score de análisis"}</div>
         <div style={{ fontSize: 15, color: rating.color, fontWeight: 600, marginTop: 6 }}>{recommendation}</div>
-        <div style={{ fontSize: 11, color: "#4A6080", marginTop: 4 }}>{time} CT • {game.venue?.name}</div>
+        <div style={{ fontSize: 11, color: "#4A6080", marginTop: 4 }}>{isLocked ? "🔴 EN CURSO" : `${time} CT`} • {game.venue?.name}</div>
+        {isStrong && !isLocked && <div style={{ marginTop: 8, fontSize: 12, color: "#00E096", fontWeight: 700 }}>⭐ PICK RECOMENDADO — MC 85%+</div>}
       </div>
 
       {simulation && (
         <div style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: "14px", marginBottom: 14 }}>
           <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 10 }}>MONTE CARLO — {simulation.simulations.toLocaleString()} SIMULACIONES</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
-            <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.homeWinPct > simulation.awayWinPct ? "#00E09640" : "#1A2535"}` }}>
+            <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.homeWinPct >= 85 ? "#00E09640" : "#1A2535"}` }}>
               <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 4 }}>LOCAL GANA</div>
               <div style={{ fontSize: 28, fontWeight: 700, color: simulation.homeWinPct > simulation.awayWinPct ? "#00E096" : "#7A9CC0" }}>{simulation.homeWinPct}%</div>
               <div style={{ fontSize: 10, color: "#4A6080", marginTop: 4 }}>~{simulation.avgHomeRuns} carreras</div>
             </div>
-            <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.awayWinPct > simulation.homeWinPct ? "#FF9F4340" : "#1A2535"}` }}>
+            <div style={{ background: "#080C14", borderRadius: 8, padding: "10px", textAlign: "center", border: `1px solid ${simulation.awayWinPct >= 85 ? "#FF9F4340" : "#1A2535"}` }}>
               <div style={{ fontSize: 9, color: "#4A6080", marginBottom: 4 }}>VISITANTE GANA</div>
               <div style={{ fontSize: 28, fontWeight: 700, color: simulation.awayWinPct > simulation.homeWinPct ? "#FF9F43" : "#7A9CC0" }}>{simulation.awayWinPct}%</div>
               <div style={{ fontSize: 10, color: "#4A6080", marginTop: 4 }}>~{simulation.avgAwayRuns} carreras</div>
@@ -426,7 +532,7 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
         </div>
       )}
 
-      {alreadyPicked ? (
+      {!isLocked && (alreadyPicked ? (
         <div style={{ background: "#00E09615", border: "1px solid #00E09640", borderRadius: 10, padding: "12px", marginBottom: 14, textAlign: "center" }}>
           <div style={{ fontSize: 12, color: "#00E096" }}>✓ Pick registrado: <strong>{alreadyPicked.my_pick}</strong></div>
         </div>
@@ -445,6 +551,12 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
           </div>
           {pickSaved && <div style={{ textAlign: "center", color: "#00E096", fontSize: 12, marginTop: 8 }}>✓ Pick guardado</div>}
         </div>
+      ))}
+
+      {isLocked && (
+        <div style={{ background: "#FF6B6B15", border: "1px solid #FF6B6B40", borderRadius: 10, padding: "12px", marginBottom: 14, textAlign: "center" }}>
+          <div style={{ fontSize: 12, color: "#FF6B6B" }}>🔒 Juego en curso — no se pueden registrar picks</div>
+        </div>
       )}
 
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -455,7 +567,12 @@ function DetailView({ analysis, onBack, onSavePick, savingPick, pickSaved, picks
           <div key={label} style={{ background: "#0D1520", border: "1px solid #1A2535", borderRadius: 10, padding: 12 }}>
             <div style={{ fontSize: 10, color: "#4A6080", letterSpacing: "0.1em", marginBottom: 4 }}>{label}</div>
             <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{teamName}</div>
-            <div style={{ fontSize: 11, color: "#7A9CC0", marginBottom: 8, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{emoji} {pitcher.name}</div>
+            <div style={{ fontSize: 11, color: "#7A9CC0", marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{emoji} {pitcher.name}</div>
+            {pitcher.role && (
+              <div style={{ marginBottom: 8, display: "inline-block", padding: "2px 8px", borderRadius: 4, fontSize: 10, fontWeight: 700, background: pitcher.role.isStarter ? "#00E09615" : "#FF9F4320", color: pitcher.role.isStarter ? "#00E096" : "#FF9F43", border: `1px solid ${pitcher.role.isStarter ? "#00E09640" : "#FF9F4340"}` }}>
+                {pitcher.role.isStarter ? "✅ ABRIDOR" : "⚠️ RELEVISTA — análisis menos confiable"}
+              </div>
+            )}
             {pitcher.form && (
               <div style={{ marginBottom: 8, padding: "6px 8px", borderRadius: 6, background: pitcher.form.trend === "hot" ? "#00E09615" : pitcher.form.trend === "cold" ? "#FF6B6B15" : "#1A2535", border: `1px solid ${pitcher.form.trend === "hot" ? "#00E09640" : pitcher.form.trend === "cold" ? "#FF6B6B40" : "#1A2535"}` }}>
                 <div style={{ fontSize: 9, color: "#4A6080" }}>ÚLTIMAS {pitcher.form.lastStarts} SALIDAS</div>

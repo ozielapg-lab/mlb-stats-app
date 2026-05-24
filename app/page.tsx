@@ -184,7 +184,7 @@ function buildLambdas(
 
     // Escalar carreras por el FIP efectivo relativo a la liga.
     // FIP bajo (bueno) => menos carreras del rival.
-    let adjusted = offenseRPG * (effectiveFip / base);
+    let adjusted = offenseRPG * Math.pow(effectiveFip / base, 1.4);
 
     // Split L/R: aplicar SOLO como ajuste fino, no multiplicativo total
     // (fix del bug de doble-conteo del V5: ahora es un nudge de +-, no x).
@@ -390,10 +390,10 @@ function getConfidence(sim: SimResult | null, homeSP: PitcherRole | null, awaySP
   const max = Math.max(sim.homeWinPct, sim.awayWinPct);
   // Si algun pitcher no es SP real, bajar el techo de confianza
   const bothReal = homeSP === "SP" && awaySP === "SP";
-  if (!bothReal) return max >= 75 ? "moderate" : "weak";
-  if (max >= 80) return "strong";
-  if (max >= 70) return "moderate";
-  if (max >= 60) return "weak";
+  if (!bothReal) return max >= 63 ? "moderate" : "weak";
+  if (max >= 66) return "strong";
+  if (max >= 61) return "moderate";
+  if (max >= 56) return "weak";
   return "none";
 }
 
